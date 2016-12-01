@@ -23,17 +23,18 @@
 // seeking within a file during a write may totally destroy data. Consider yourself warned.
 using System;
 using System.Collections.Generic;
-using System.Collections;
 using System.Linq;
-using System.Text;
-using Dokan;
+using DokanNet;
 using System.IO;
-using Microsoft.WindowsAzure.StorageClient;
-using Microsoft.WindowsAzure;
+using System.Security.AccessControl;
+using Microsoft.WindowsAzure.Storage;
+using Microsoft.WindowsAzure.Storage.Blob;
+using Microsoft.WindowsAzure.Storage.Shared.Protocol;
+using FileAccess = DokanNet.FileAccess;
 
 namespace BlobMount
 {
-    public class WindowsAzureBlobFS : DokanOperations
+    public class WindowsAzureBlobFS : IDokanOperations
     {
         // Mount takes the following arguments:
         //
@@ -44,75 +45,53 @@ namespace BlobMount
         // Translates Dokan error messages to friendly text.
         public static void Mount(string[] args)
         {
-            switch (DokanNet.DokanMain(new DokanOptions
+            try
             {
-                MountPoint = args[0],
-                DebugMode = true,
-                UseStdErr = true,
-                VolumeLabel = "WindowsAzureBlobDrive"
-            }, new WindowsAzureBlobFS(args[1], args[2])))
+                var fs = new WindowsAzureBlobFS(args[1]);
+                fs.Mount(args[0], DokanOptions.DebugMode | DokanOptions.StderrOutput);
+                Console.WriteLine("Success");
+            }
+            catch (DokanException e)
             {
-                case DokanNet.DOKAN_DRIVE_LETTER_ERROR:
-                    Console.WriteLine("Drive letter error");
-                    break;
-                case DokanNet.DOKAN_DRIVER_INSTALL_ERROR:
-                    Console.WriteLine("Driver install error");
-                    break;
-                case DokanNet.DOKAN_MOUNT_ERROR:
-                    Console.WriteLine("Mount error");
-                    break;
-                case DokanNet.DOKAN_START_ERROR:
-                    Console.WriteLine("Start error");
-                    break;
-                case DokanNet.DOKAN_ERROR:
-                    Console.WriteLine("Unknown error");
-                    break;
-                case DokanNet.DOKAN_SUCCESS:
-                    Console.WriteLine("Success");
-                    break;
-                default:
-                    Console.WriteLine("Unknown status");
-                    break;
+                Console.WriteLine("Error: " + e.Message);
             }
         }
 
         private CloudBlobClient blobs;
 
         // Initialize with a cloud storage account and key.
-        public WindowsAzureBlobFS(string account, string key)
+        public WindowsAzureBlobFS(string connectionString)
         {
-            blobs = new CloudStorageAccount(new StorageCredentialsAccountAndKey(account, key), false).CreateCloudBlobClient();
+            blobs = CloudStorageAccount.Parse(connectionString).CreateCloudBlobClient();
         }
 
         // Close the corresponding BlobStream, if any, to commit the changes.
-        public int Cleanup(string filename, DokanFileInfo info)
+        public void Cleanup(string fileName, DokanFileInfo info)
         {
-            if (readBlobs.ContainsKey(filename)) readBlobs[filename].Close();
-            if (writeBlobs.ContainsKey(filename)) writeBlobs[filename].Close();
-            return 0;
+            if (readBlobs.ContainsKey(fileName)) readBlobs[fileName].Close();
+            if (writeBlobs.ContainsKey(fileName)) writeBlobs[fileName].Close();
         }
 
         // Call close on the underlying BlobStream (if any) so writes are committed and buffered reads are discarded.
-        public int CloseFile(string filename, DokanFileInfo info)
+        public void CloseFile(string fileName, DokanFileInfo info)
         {
-            if (writeBlobs.ContainsKey(filename))
+            if (writeBlobs.ContainsKey(fileName))
             {
-                writeBlobs[filename].Close();
-                writeBlobs.Remove(filename);
+                writeBlobs[fileName].Close();
+                writeBlobs.Remove(fileName);
             }
-            if (readBlobs.ContainsKey(filename))
+            if (readBlobs.ContainsKey(fileName))
             {
-                readBlobs[filename].Close();
-                readBlobs.Remove(filename);
+                readBlobs[fileName].Close();
+                readBlobs.Remove(fileName);
             }
-            return 0;
         }
 
         // Keep track of empty directories (in memory).
         private HashSet<string> emptyDirectories = new HashSet<string>();
         private IEnumerable<string> EnumeratePathAndParents(string directory)
         {
-            var split = directory.Split(new [] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+            var split = directory.Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
             var path = "\\" + split.FirstOrDefault() ?? "";
             foreach (var segment in split.Skip(1))
             {
@@ -120,6 +99,7 @@ namespace BlobMount
                 yield return path;
             }
         }
+
         private bool AddEmptyDirectories(string directory)
         {
             bool alreadyExisted = false;
@@ -130,6 +110,7 @@ namespace BlobMount
             Console.WriteLine("emptyDirectories:\n\t" + string.Join("\n\t", emptyDirectories));
             return alreadyExisted;
         }
+
         private void RemoveEmptyDirectories(string directory)
         {
             foreach (var path in EnumeratePathAndParents(directory))
@@ -140,9 +121,9 @@ namespace BlobMount
         }
 
         // CreateDirectory creates a container if at the top level and otherwise creates an empty directory (tracked in memory only).
-        public int CreateDirectory(string filename, DokanFileInfo info)
+        private NtStatus CreateDirectory(string fileName, DokanFileInfo info)
         {
-            var split = filename.Split(new[] { Path.DirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries);
+            var split = fileName.Split(new[] { Path.DirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries);
 
             if (split.Length == 1)
             {
@@ -150,12 +131,12 @@ namespace BlobMount
                 {
                     blobs.GetContainerReference(split[0]).Create();
                 }
-                catch (StorageClientException e)
+                catch (StorageException e)
                 {
-                    if (e.ErrorCode == StorageErrorCode.ContainerAlreadyExists)
+                    if (e.RequestInformation.ExtendedErrorInformation.ErrorCode == StorageErrorCodeStrings.ContainerAlreadyExists)
                     {
                         // TODO: This doesn't seem to give the right error message when I try to "md" a container that already exists.
-                        return -DokanNet.ERROR_ALREADY_EXISTS;
+                        return DokanResult.AlreadyExists;
                     }
                     throw;
                 }
@@ -164,20 +145,20 @@ namespace BlobMount
             else
             {
                 // Use OpenDirectory as a way to test for existence of a directory.
-                if (OpenDirectory(filename, info) == 0)
+                if (OpenDirectory(fileName, info) == NtStatus.Success)
                 {
-                    return -DokanNet.ERROR_ALREADY_EXISTS;
+                    return DokanResult.AlreadyExists;
                 }
                 else
                 {
                     // Track the empty directory in memory.
-                    if (!AddEmptyDirectories(filename))
+                    if (!AddEmptyDirectories(fileName))
                     {
-                        return -DokanNet.ERROR_ALREADY_EXISTS;
+                        return DokanResult.AlreadyExists;
                     }
                     else
                     {
-                        return 0;
+                        return DokanResult.Success;
                     }
                 }
             }
@@ -185,25 +166,31 @@ namespace BlobMount
 
         // Create file does nothing except validate that the file requested is okay to create.
         // Actual creation of a corresponding blob in cloud storage is done when the file is actually written.
-        public int CreateFile(string filename, FileAccess access, FileShare share, FileMode mode, FileOptions options, DokanFileInfo info)
+        public NtStatus CreateFile(string fileName, FileAccess access, FileShare share, FileMode mode, FileOptions options, FileAttributes attributes, DokanFileInfo info)
         {
-            // When trying to open a file for reading, succeed only if the file already exists.
-            if (mode == FileMode.Open && (access == FileAccess.Read || access == FileAccess.ReadWrite))
+            if (info.IsDirectory)
             {
-                if (GetFileInformation(filename, new FileInformation(), new DokanFileInfo(0)) == 0)
+                return CreateDirectory(fileName, info);
+            }
+
+            // When trying to open a file for reading, succeed only if the file already exists.
+            if (mode == FileMode.Open && (access == FileAccess.GenericRead || access == FileAccess.GenericWrite))
+            {
+                FileInformation fileInfo;
+                if (GetFileInformation(fileName, out fileInfo, info) == 0)
                 {
                     return 0;
                 }
                 else
                 {
-                    return -DokanNet.ERROR_FILE_NOT_FOUND;
+                    return DokanResult.FileNotFound;
                 }
             }
             // When creating a file, always succeed. (Empty directories will be implicitly created as needed.)
             else if (mode == FileMode.Create || mode == FileMode.OpenOrCreate)
             {
                 // Since we're creating a file, we don't need to track the parents (up the tree) as empty directories any longer.
-                RemoveEmptyDirectories(Path.GetDirectoryName(filename));
+                RemoveEmptyDirectories(Path.GetDirectoryName(fileName));
                 return 0;
             }
             else
@@ -214,9 +201,9 @@ namespace BlobMount
 
         // DeleteDirectory removes a container if it's at the root level, fails if a directory is not empty,
         // and removes a tracked empty directory if one exists.
-        public int DeleteDirectory(string filename, DokanFileInfo info)
+        public NtStatus DeleteDirectory(string fileName, DokanFileInfo info)
         {
-            var split = filename.Trim('\\').Split(Path.DirectorySeparatorChar);
+            var split = fileName.Trim('\\').Split(Path.DirectorySeparatorChar);
             if (split.Length == 1)
             {
                 try
@@ -224,109 +211,127 @@ namespace BlobMount
                     blobs.GetContainerReference(split[0]).Delete();
                     return 0;
                 }
-                catch { return -1; }
+                catch { return DokanResult.Error; }
             }
-            if (blobs.ListBlobsWithPrefix(filename.Trim('\\').Replace('\\', '/')).Any())
+            if (blobs.ListBlobs(fileName.Trim('\\').Replace('\\', '/')).Any())
             {
                 // TODO: Revisit what a better error code might be.
-                return -1;
+                return DokanResult.Error;
             }
-            else if (emptyDirectories.Any(f => f.StartsWith(filename + "\\")))
+            else if (emptyDirectories.Any(f => f.StartsWith(fileName + "\\")))
             {
                 // TODO: Revisit what a better error code might be.
-                return -1;
+                return DokanResult.Error;
             }
             else
             {
-                emptyDirectories.Remove(filename);
-                return 0;
+                emptyDirectories.Remove(fileName);
+                return DokanResult.Success;
             }
         }
 
         // DeleteFile tries to delete the corresponding blob and ensures the parent directory is tracked as empty.
-        public int DeleteFile(string filename, DokanFileInfo info)
+        public NtStatus DeleteFile(string fileName, DokanFileInfo info)
         {
             try
             {
-                blobs.GetBlobReference(filename.Trim('\\')).Delete();
-                if (!blobs.ListBlobsWithPrefix(Path.GetDirectoryName(filename).Trim('\\').Replace('\\', '/')).Any())
+                var blob = blobs.GetBlobReferenceFromServer(blobs.ListBlobs(fileName.Trim('\\')).First().StorageUri);
+                blob.Delete();
+                if (!blobs.ListBlobs(Path.GetDirectoryName(fileName).Trim('\\').Replace('\\', '/')).Any())
                 {
-                    AddEmptyDirectories(Path.GetDirectoryName(filename));
+                    AddEmptyDirectories(Path.GetDirectoryName(fileName));
                 }
-                return 0;
+                return DokanResult.Success;
             }
-            catch { return -1; }
+            catch { return DokanResult.Error; }
         }
 
         // FindFiles enumerates blobs and blob prefixes and represents them as files and directories.
-        public int FindFiles(string filename, ArrayList files, DokanFileInfo info)
+        public NtStatus FindFiles(string fileName, out IList<FileInformation> files, DokanFileInfo info)
         {
-            if (filename == "\\")
+            files = new List<FileInformation>();
+
+            if (fileName == "\\")
             {
-                files.AddRange(blobs.ListContainers().Select(c => new FileInformation
+                foreach (var blob in blobs.ListContainers())
                 {
-                    FileName = c.Name,
-                    Attributes = FileAttributes.Directory,
-                    CreationTime = c.Properties.LastModifiedUtc,
-                    LastAccessTime = c.Properties.LastModifiedUtc,
-                    LastWriteTime = c.Properties.LastModifiedUtc
-                }).ToList());
+                    files.Add(new FileInformation
+                    {
+                        FileName = blob.Name,
+                        Attributes = FileAttributes.Directory,
+                        CreationTime = blob.Properties.LastModified?.UtcDateTime,
+                        LastAccessTime = blob.Properties.LastModified?.UtcDateTime,
+                        LastWriteTime = blob.Properties.LastModified?.UtcDateTime
+                    });
+                }
             }
             else
             {
-                var split = filename.Trim('\\').Split(Path.DirectorySeparatorChar);
+                var split = fileName.Trim('\\').Split(Path.DirectorySeparatorChar);
                 var container = blobs.GetContainerReference(split[0]);
                 IEnumerable<IListBlobItem> items =
                     split.Length > 1
-                    ? container.GetDirectoryReference(string.Join("/", split.Skip(1).Take(split.Length - 1))).ListBlobs()
-                    : container.ListBlobs();
-                files.AddRange(items.Select(c => new FileInformation
+                        ? container.GetDirectoryReference(string.Join("/", split.Skip(1).Take(split.Length - 1)))
+                            .ListBlobs()
+                        : container.ListBlobs();
+
+                foreach (var blob in items)
                 {
-                    FileName = c.Uri.AbsolutePath.Substring(filename.Length + 1).TrimEnd('/'),
-                    Attributes = (c is CloudBlobDirectory) ? FileAttributes.Directory : FileAttributes.Normal,
-                    CreationTime = (c is CloudBlob) ? ((CloudBlob)c).Properties.LastModifiedUtc : DateTime.UtcNow,
-                    LastAccessTime = (c is CloudBlob) ? ((CloudBlob)c).Properties.LastModifiedUtc : DateTime.UtcNow,
-                    LastWriteTime = (c is CloudBlob) ? ((CloudBlob)c).Properties.LastModifiedUtc : DateTime.UtcNow,
-                    Length = (c is CloudBlob) ? ((CloudBlob)c).Properties.Length : 0
-                }).ToList());
-                files.AddRange(emptyDirectories.Where(f => f.StartsWith(filename + "\\") && !f.Substring(filename.Length + 1).Contains("\\")).Select(f => new FileInformation
+                    files.Add(new FileInformation
+                    {
+                        FileName = blob.Uri.AbsolutePath.Substring(fileName.Length + 1).TrimEnd('/'),
+                        Attributes = (blob is CloudBlobDirectory) ? FileAttributes.Directory : FileAttributes.Normal,
+                        CreationTime = (blob is CloudBlob) ? ((CloudBlob)blob).Properties.LastModified?.UtcDateTime : DateTime.UtcNow,
+                        LastAccessTime = (blob is CloudBlob) ? ((CloudBlob)blob).Properties.LastModified?.UtcDateTime : DateTime.UtcNow,
+                        LastWriteTime = (blob is CloudBlob) ? ((CloudBlob)blob).Properties.LastModified?.UtcDateTime : DateTime.UtcNow,
+                        Length = (blob is CloudBlob) ? ((CloudBlob)blob).Properties.Length : 0
+                    });
+                }
+                foreach (
+                    var dir in
+                    emptyDirectories.Where(
+                        f => f.StartsWith(fileName + "\\") && !f.Substring(fileName.Length + 1).Contains("\\")))
                 {
-                    FileName = f.Substring(filename.Length + 1),
-                    Attributes = FileAttributes.Directory,
-                    CreationTime = DateTime.UtcNow,
-                    LastAccessTime = DateTime.UtcNow,
-                    LastWriteTime = DateTime.UtcNow,
-                    Length = 0
-                }).ToList());
+                    files.Add(new FileInformation
+                    {
+                        FileName = dir.Substring(fileName.Length + 1),
+                        Attributes = FileAttributes.Directory,
+                        CreationTime = DateTime.UtcNow,
+                        LastAccessTime = DateTime.UtcNow,
+                        LastWriteTime = DateTime.UtcNow,
+                        Length = 0
+                    });
+                }
             }
-            return 0;
+            return DokanResult.Success;
         }
 
-        public int FlushFileBuffers(string filename, DokanFileInfo info)
+        public NtStatus FlushFileBuffers(string fileName, DokanFileInfo info)
         {
-            return 0;
+            return DokanResult.Success;
         }
 
         // GetDiskFreeSpace returns hardcoded values.
-        public int GetDiskFreeSpace(ref ulong freeBytesAvailable, ref ulong totalBytes, ref ulong totalFreeBytes, DokanFileInfo info)
+        public NtStatus GetDiskFreeSpace(out long freeBytesAvailable, out long totalNumberOfBytes, out long totalNumberOfFreeBytes, DokanFileInfo info)
         {
             freeBytesAvailable = 512 * 1024 * 1024;
-            totalBytes = 1024 * 1024 * 1024;
-            totalFreeBytes = 512 * 1024 * 1024;
-            return 0;
+            totalNumberOfBytes = 1024 * 1024 * 1024;
+            totalNumberOfFreeBytes = 512 * 1024 * 1024;
+            return DokanResult.Success;
         }
 
         // GetFileInformation returns information about a container at the top level, blob prefixes at lower levels,
         // and empty directories (tracked in memory). File times are all specified as `DateTime.UtcNow`.
-        public int GetFileInformation(string filename, FileInformation fileinfo, DokanFileInfo info)
+        public NtStatus GetFileInformation(string fileName, out FileInformation fileInfo, DokanFileInfo info)
         {
-            var split = filename.Split(new[] { Path.DirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries);
+            fileInfo = new FileInformation();
+            var split = fileName.Split(new[] { Path.DirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries);
             if (split.Length == 0)
             {
-                fileinfo.Attributes = FileAttributes.Directory;
-                fileinfo.CreationTime = DateTime.UtcNow;
-                fileinfo.LastAccessTime = DateTime.UtcNow;
-                fileinfo.LastWriteTime = DateTime.UtcNow;
+                fileInfo.Attributes = FileAttributes.Directory;
+                fileInfo.CreationTime = DateTime.UtcNow;
+                fileInfo.LastAccessTime = DateTime.UtcNow;
+                fileInfo.LastWriteTime = DateTime.UtcNow;
                 return 0;
             }
             if (split.Length == 1)
@@ -334,126 +339,159 @@ namespace BlobMount
                 var container = blobs.ListContainers(split[0]).FirstOrDefault();
                 if (container != null && container.Name == split[0])
                 {
-                    fileinfo.Attributes = FileAttributes.Directory;
-                    fileinfo.CreationTime = DateTime.UtcNow;
-                    fileinfo.LastAccessTime = DateTime.UtcNow;
-                    fileinfo.LastWriteTime = DateTime.UtcNow;
+                    fileInfo.Attributes = FileAttributes.Directory;
+                    fileInfo.CreationTime = DateTime.UtcNow;
+                    fileInfo.LastAccessTime = DateTime.UtcNow;
+                    fileInfo.LastWriteTime = DateTime.UtcNow;
                     return 0;
                 }
                 else
                 {
-                    return -1;
+                    return DokanResult.Error;
                 }
             }
-            var blob = blobs.GetBlobReference(filename.Trim('\\'));
+            var blob = blobs.GetBlobReferenceFromServer(blobs.ListBlobs(fileName.Trim('\\')).First().StorageUri);
             try
             {
                 blob.FetchAttributes();
-                fileinfo.CreationTime = blob.Properties.LastModifiedUtc;
-                fileinfo.LastWriteTime = blob.Properties.LastModifiedUtc;
-                fileinfo.LastAccessTime = DateTime.UtcNow;
-                fileinfo.Length = blob.Properties.Length;
+                fileInfo.CreationTime = blob.Properties.LastModified?.UtcDateTime;
+                fileInfo.LastWriteTime = blob.Properties.LastModified?.UtcDateTime;
+                fileInfo.LastAccessTime = DateTime.UtcNow;
+                fileInfo.Length = blob.Properties.Length;
                 return 0;
             }
             catch
             {
-                if (emptyDirectories.Contains(filename) || blobs.ListBlobsWithPrefix(filename.Trim('\\').Replace('\\', '/')).Any())
+                if (emptyDirectories.Contains(fileName) || blobs.ListBlobs(fileName.Trim('\\').Replace('\\', '/')).Any())
                 {
-                    fileinfo.Attributes = FileAttributes.Directory;
-                    fileinfo.CreationTime = DateTime.UtcNow;
-                    fileinfo.LastAccessTime = DateTime.UtcNow;
-                    fileinfo.LastWriteTime = DateTime.UtcNow;
+                    fileInfo.Attributes = FileAttributes.Directory;
+                    fileInfo.CreationTime = DateTime.UtcNow;
+                    fileInfo.LastAccessTime = DateTime.UtcNow;
+                    fileInfo.LastWriteTime = DateTime.UtcNow;
                     return 0;
                 }
                 else
                 {
-                    return -DokanNet.ERROR_FILE_NOT_FOUND;
+                    return DokanResult.FileNotFound;
                 }
             }
         }
 
-        // TODO: Perhaps use leases on blobs to do locking?
-        public int LockFile(string filename, long offset, long length, DokanFileInfo info)
+        public NtStatus FindFilesWithPattern(string fileName, string searchPattern, out IList<FileInformation> files, DokanFileInfo info)
         {
-            return 0;
+            throw new NotImplementedException();
+        }
+
+        public NtStatus FindStreams(string fileName, out IList<FileInformation> streams, DokanFileInfo info)
+        {
+            throw new NotImplementedException();
+        }
+
+        public NtStatus GetFileSecurity(string fileName, out FileSystemSecurity security, AccessControlSections sections, DokanFileInfo info)
+        {
+            throw new NotImplementedException();
+        }
+
+        public NtStatus GetVolumeInformation(out string volumeLabel, out FileSystemFeatures features, out string fileSystemName, DokanFileInfo info)
+        {
+            throw new NotImplementedException();
+        }
+
+        // TODO: Perhaps use leases on blobs to do locking?
+        public NtStatus LockFile(string fileName, long offset, long length, DokanFileInfo info)
+        {
+            return DokanResult.Success;
+        }
+
+        public NtStatus Mounted(DokanFileInfo info)
+        {
+            return DokanResult.Success;
         }
 
         // TODO: Use copy and then delete to do an efficient move where possible.
-        public int MoveFile(string filename, string newname, bool replace, DokanFileInfo info)
+        public NtStatus MoveFile(string oldName, string newName, bool replace, DokanFileInfo info)
         {
             throw new NotImplementedException();
         }
 
         // OpenDirectory succeeds as long as the specified path is an empty directory (tracked in memory)
         // or a blob prefix containing blobs (discovered via GetFileInformation returning a success code with a directory).
-        public int OpenDirectory(string filename, DokanFileInfo info)
+        private NtStatus OpenDirectory(string fileName, DokanFileInfo info)
         {
-            if (emptyDirectories.Contains(filename)) return 0;
-            var fileinfo = new FileInformation();
-            var status = GetFileInformation(filename, fileinfo, info);
+            if (emptyDirectories.Contains(fileName)) return 0;
+            FileInformation fileinfo;
+            var status = GetFileInformation(fileName, out fileinfo, info);
             if ((status == 0) && (fileinfo.Attributes == FileAttributes.Directory)) return 0;
-            return -DokanNet.ERROR_FILE_NOT_FOUND;
+            return DokanResult.FileNotFound;
         }
 
         // Keep track of open streams for reading blobs. (Done this way instead of making an HTTP call for each read
         // operation so that we can do read-ahead (significant perf gain for normal operations like reading an entire file).
-        private Dictionary<string, BlobStream> readBlobs = new Dictionary<string, BlobStream>();
-        public int ReadFile(string filename, byte[] buffer, ref uint readBytes, long offset, DokanFileInfo info)
+        private Dictionary<string, Stream> readBlobs = new Dictionary<string, Stream>();
+        public NtStatus ReadFile(string fileName, byte[] buffer, out int bytesRead, long offset, DokanFileInfo info)
         {
-            if (!readBlobs.ContainsKey(filename))
+            if (!readBlobs.ContainsKey(fileName))
             {
-                readBlobs[filename] = blobs.GetBlobReference(filename.Trim('\\')).OpenRead();
+                var blobUri = blobs.ListBlobs(fileName.Trim('\\')).First().StorageUri;
+                readBlobs[fileName] = blobs.GetBlobReferenceFromServer(blobUri).OpenRead();
             }
-            readBlobs[filename].Position = offset;
-            readBytes = (uint)readBlobs[filename].Read(buffer, 0, buffer.Length);
-            return 0;
+            readBlobs[fileName].Position = offset;
+            bytesRead = readBlobs[fileName].Read(buffer, 0, buffer.Length);
+            return DokanResult.Success;
         }
 
         // TODO: Figure out what this is supposed to do and maybe do it. :)
-        public int SetAllocationSize(string filename, long length, DokanFileInfo info)
+        public NtStatus SetAllocationSize(string fileName, long length, DokanFileInfo info)
         {
             return 0;
         }
 
         // TODO: This is presumably to truncate a file? This could be implemented in the future.
-        public int SetEndOfFile(string filename, long length, DokanFileInfo info)
+        public NtStatus SetEndOfFile(string fileName, long length, DokanFileInfo info)
         {
             throw new NotImplementedException();
         }
 
         // TODO: Consider implementing this.
-        public int SetFileAttributes(string filename, FileAttributes attr, DokanFileInfo info)
+        public NtStatus SetFileAttributes(string fileName, FileAttributes attributes, DokanFileInfo info)
+        {
+            throw new NotImplementedException();
+        }
+
+        public NtStatus SetFileSecurity(string fileName, FileSystemSecurity security, AccessControlSections sections, DokanFileInfo info)
         {
             throw new NotImplementedException();
         }
 
         // SetFileTime isn't supported, since we don't actually track meaningful times for most of this.
-        public int SetFileTime(string filename, DateTime ctime, DateTime atime, DateTime mtime, DokanFileInfo info)
+        public NtStatus SetFileTime(string fileName, DateTime? creationTime, DateTime? lastAccessTime, DateTime? lastWriteTime,
+            DokanFileInfo info)
         {
             throw new NotImplementedException();
         }
 
         // TODO: Perhaps use leases on blobs to do locking?
-        public int UnlockFile(string filename, long offset, long length, DokanFileInfo info)
+        public NtStatus UnlockFile(string fileName, long offset, long length, DokanFileInfo info)
         {
-            return 0;
+            return DokanResult.Success;
         }
 
         // Close everything.
-        public int Unmount(DokanFileInfo info)
+        public NtStatus Unmounted(DokanFileInfo info)
         {
             foreach (var filename in readBlobs.Keys) CloseFile(filename, info);
             foreach (var filename in writeBlobs.Keys) CloseFile(filename, info);
-            return 0;
+            return DokanResult.Success;
         }
 
         private Dictionary<string, Stream> writeBlobs = new Dictionary<string, Stream>();
-        public int WriteFile(string filename, byte[] buffer, ref uint writtenBytes, long offset, DokanFileInfo info)
+        public NtStatus WriteFile(string fileName, byte[] buffer, out int bytesWritten, long offset, DokanFileInfo info)
         {
-            if (!writeBlobs.ContainsKey(filename))
+            if (!writeBlobs.ContainsKey(fileName))
             {
-                var blob = blobs.GetBlockBlobReference(filename.TrimStart('\\'));
-                writeBlobs[filename] = blob.OpenWrite();
+                var blobUri = blobs.ListBlobs(fileName.TrimStart('\\')).First().StorageUri;
+                var blob = blobs.GetBlobReferenceFromServer(blobUri).Container.GetBlockBlobReference(fileName.TrimStart('\\'));
+                writeBlobs[fileName] = blob.OpenWrite();
                 if (offset != 0)
                 {
                     blob.FetchAttributes();
@@ -462,8 +500,9 @@ namespace BlobMount
                         // TODO: This is a really inefficient way to do this.
                         // The right thing to do is to start writing new blocks and then commit *old blocks* + *new blocks*.
                         // This method is okay for small files and "works."
-                        var previousBytes = blob.DownloadByteArray();
-                        writeBlobs[filename].Write(previousBytes, 0, previousBytes.Length);
+                        var previousBytes = new byte[blob.Properties.Length];
+                        blob.DownloadToByteArray(previousBytes, 0);
+                        writeBlobs[fileName].Write(previousBytes, 0, previousBytes.Length);
                     }
                     else
                     {
@@ -472,9 +511,9 @@ namespace BlobMount
                     }
                 }
             }
-            writeBlobs[filename].Write(buffer, 0, buffer.Length);
-            writtenBytes = (uint)buffer.Length;
-            return 0;
+            writeBlobs[fileName].Write(buffer, 0, buffer.Length);
+            bytesWritten = buffer.Length;
+            return DokanResult.Success;
         }
     }
 
